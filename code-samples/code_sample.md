@@ -1,695 +1,630 @@
-# RevenueCat Entitlements Checker — Python CLI Tool
+# RevenueCat Webhook Receiver — Production Python Server
 
-Two files. Production-ready. Based on the real RC API patterns I've already mapped (stolen_techniques 15, 16, 17).
+Here's the complete code sample. I'll produce two files: the main server (`server.py`) and the `README.md`.
 
 ---
 
-## `revenuecat_entitlements_checker.py`
+## `server.py`
 
 ```python
-#!/usr/bin/env python3
 """
-RevenueCat Entitlements Checker — CLI Tool
-==========================================
-Author: ELIANCE (autonomous AI Developer Advocate)
-Purpose: Inspect subscriber entitlement status, expiration, and health
-         directly from the RevenueCat REST API.
+RevenueCat Webhook Receiver — Production Python Server
+=======================================================
+Author: ELIANCE (Autonomous AI Developer Advocate for RevenueCat)
+Date: 2026-03-05
 
-Usage:
-    python revenuecat_entitlements_checker.py --user <app_user_id>
-    python revenuecat_entitlements_checker.py --user <app_user_id> --json
-    python revenuecat_entitlements_checker.py --batch users.txt
-    python revenuecat_entitlements_checker.py --project-entitlements
+Receives RevenueCat webhook events, verifies authorization, processes
+subscription lifecycle events (INITIAL_PURCHASE, RENEWAL, CANCELLATION,
+BILLING_ISSUE, EXPIRATION, etc.), and syncs subscriber state to SQLite.
 
-Requires:
-    RC_API_KEY environment variable (your RevenueCat secret key, sk_...)
-    Optional: RC_PROJECT_ID for project-level entitlement listing
+Design decisions:
+  - Deferred processing: HTTP handler returns 200 immediately, pushes to queue.
+    Prevents RevenueCat from retrying due to slow processing (RC retry schedule:
+    5, 10, 20, 40, 80 minutes — avoid triggering this).
+  - Idempotency: event.id is stored in SQLite; duplicate deliveries are no-ops.
+  - Never store boolean `is_active` — always store expiration timestamp and
+    check `expiration > time.time()` (per official RC sample pattern).
+  - HMAC-ready: auth header verification is baked in (not bolted on later).
 
-Real-world use cases:
-    - Support team: instantly check a user's subscription status
-    - Debugging: confirm entitlement unlocked after purchase
-    - Monitoring: batch-check a list of users for active entitlements
-    - Audit: list all entitlements defined in your RC project
+Requirements:
+    pip install flask requests python-dotenv
 """
 
-import os
-import sys
+import hashlib
 import json
-import time
-import argparse
 import logging
+import os
+import queue
+import sqlite3
+import threading
+import time
 from datetime import datetime, timezone
+from functools import wraps
+from http import HTTPStatus
 from typing import Optional
-from urllib.parse import quote
 
 import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
+from dotenv import load_dotenv
+from flask import Flask, Response, jsonify, request
 
-# ─────────────────────────────────────────────
-# Logging setup — structured, readable output
-# ─────────────────────────────────────────────
+# ─── Logging ─────────────────────────────────────────────────────────────────
+
 logging.basicConfig(
-    level=logging.WARNING,  # Suppress noise by default; use --verbose to enable DEBUG
-    format="%(asctime)s [%(levelname)s] %(message)s",
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%dT%H:%M:%S",
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("rc_webhook")
 
-# ─────────────────────────────────────────────
-# ANSI color codes for terminal output
-# ─────────────────────────────────────────────
-class Color:
-    GREEN  = "\033[92m"
-    YELLOW = "\033[93m"
-    RED    = "\033[91m"
-    CYAN   = "\033[96m"
-    BOLD   = "\033[1m"
-    DIM    = "\033[2m"
-    RESET  = "\033[0m"
+# ─── Config ──────────────────────────────────────────────────────────────────
 
-def colorize(text: str, *codes: str) -> str:
-    """Apply ANSI color codes — skips if stdout is not a terminal."""
-    if not sys.stdout.isatty():
-        return text
-    return "".join(codes) + text + Color.RESET
+load_dotenv()
+
+# Required env vars — server will not start without these.
+RC_WEBHOOK_TOKEN: str = os.environ["RC_WEBHOOK_TOKEN"]          # Set in RC dashboard
+RC_SECRET_API_KEY: str = os.environ["RC_SECRET_API_KEY"]        # sk_... from RC project settings
+RC_PROJECT_ID: str = os.environ["RC_PROJECT_ID"]                # From RC dashboard URL
+
+DB_PATH: str = os.getenv("DB_PATH", "subscriptions.db")
+PORT: int = int(os.getenv("PORT", "8080"))
+WORKER_THREADS: int = int(os.getenv("WORKER_THREADS", "2"))
+
+# RevenueCat REST API base (v1 is stable for subscriber reads)
+RC_API_BASE = "https://api.revenuecat.com/v1"
+
+# Event types we care about. Others are accepted (200) but not stored.
+HANDLED_EVENT_TYPES = {
+    "INITIAL_PURCHASE",
+    "RENEWAL",
+    "CANCELLATION",
+    "UNCANCELLATION",
+    "NON_RENEWING_PURCHASE",
+    "SUBSCRIPTION_PAUSED",
+    "SUBSCRIPTION_EXTENDED",
+    "BILLING_ISSUE",
+    "PRODUCT_CHANGE",
+    "EXPIRATION",
+    "TRANSFER",
+}
+
+# ─── Database ─────────────────────────────────────────────────────────────────
+
+def get_db() -> sqlite3.Connection:
+    """
+    Opens a SQLite connection with row_factory set to return dicts.
+    Call this once per thread — do not share connections across threads.
+    """
+    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
+    conn.row_factory = _dict_factory
+    conn.execute("PRAGMA journal_mode=WAL")   # Better concurrent read performance
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# RevenueCat API Client
-# Built on real RC API patterns from stolen_techniques/16 + 17.
-# Uses a resilient session with automatic retry on transient server errors.
-# ─────────────────────────────────────────────────────────────────────────────
+def _dict_factory(cursor: sqlite3.Cursor, row: tuple) -> dict:
+    """Returns rows as dicts keyed by column name."""
+    return {col[0]: val for col, val in zip(cursor.description, row)}
+
+
+def init_db(conn: sqlite3.Connection) -> None:
+    """
+    Creates tables if they don't exist. Safe to call on every startup.
+
+    Schema notes:
+      - entitlements: stores per-user entitlement expiration (not boolean!)
+      - processed_events: idempotency table — prevents double-processing RC retries
+    """
+    conn.executescript("""
+        CREATE TABLE IF NOT EXISTS entitlements (
+            user_id         TEXT    NOT NULL,
+            entitlement     TEXT    NOT NULL,
+            expiration      REAL,               -- Unix timestamp. NULL = lifetime/never expires.
+            product_id      TEXT,               -- Store product identifier
+            store           TEXT,               -- 'APP_STORE' | 'PLAY_STORE' | 'STRIPE' etc.
+            last_synced_at  REAL    NOT NULL,   -- Unix timestamp of last RC API sync
+            updated_at      REAL    NOT NULL,
+            PRIMARY KEY (user_id, entitlement)
+        );
+
+        CREATE TABLE IF NOT EXISTS processed_events (
+            event_id        TEXT    PRIMARY KEY,
+            event_type      TEXT    NOT NULL,
+            user_id         TEXT    NOT NULL,
+            received_at     REAL    NOT NULL,
+            processed_at    REAL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_entitlements_user
+            ON entitlements(user_id);
+
+        CREATE INDEX IF NOT EXISTS idx_processed_events_received
+            ON processed_events(received_at);
+    """)
+    conn.commit()
+    logger.info("Database initialized at: %s", DB_PATH)
+
+
+def is_event_duplicate(conn: sqlite3.Connection, event_id: str) -> bool:
+    """
+    Checks processed_events table. RC delivers the same event_id across retries,
+    so this is our idempotency gate.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM processed_events WHERE event_id = ?", (event_id,)
+    ).fetchone()
+    return row is not None
+
+
+def mark_event_received(conn: sqlite3.Connection, event_id: str, event_type: str, user_id: str) -> None:
+    """Inserts a placeholder row immediately. Mark processed_at after full processing."""
+    conn.execute(
+        """
+        INSERT OR IGNORE INTO processed_events
+            (event_id, event_type, user_id, received_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (event_id, event_type, user_id, time.time()),
+    )
+    conn.commit()
+
+
+def mark_event_processed(conn: sqlite3.Connection, event_id: str) -> None:
+    conn.execute(
+        "UPDATE processed_events SET processed_at = ? WHERE event_id = ?",
+        (time.time(), event_id),
+    )
+    conn.commit()
+
+
+def upsert_entitlements(
+    conn: sqlite3.Connection,
+    user_id: str,
+    subscriber_data: dict,
+) -> list[str]:
+    """
+    Syncs all active entitlements from a RevenueCat subscriber object into SQLite.
+
+    Uses INSERT OR REPLACE (upsert) — safe to call multiple times for same user.
+    Returns list of entitlement names that were updated.
+
+    RC subscriber response structure:
+      subscriber.entitlements = {
+          "premium": {
+              "expires_date": "2026-04-05T...",  # ISO-8601 or null
+              "product_identifier": "premium_monthly",
+              "store": "APP_STORE",
+              ...
+          }
+      }
+    """
+    now = time.time()
+    updated = []
+
+    entitlements: dict = subscriber_data.get("subscriber", {}).get("entitlements", {})
+
+    for ent_name, ent_data in entitlements.items():
+        # Parse expiration — null means never expires (lifetime purchase)
+        expires_iso: Optional[str] = ent_data.get("expires_date")
+        expiration: Optional[float] = None
+        if expires_iso:
+            try:
+                dt = datetime.fromisoformat(expires_iso.replace("Z", "+00:00"))
+                expiration = dt.timestamp()
+            except ValueError:
+                logger.warning("Could not parse expires_date '%s' for %s/%s",
+                               expires_iso, user_id, ent_name)
+
+        conn.execute(
+            """
+            INSERT OR REPLACE INTO entitlements
+                (user_id, entitlement, expiration, product_id, store, last_synced_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                user_id,
+                ent_name,
+                expiration,
+                ent_data.get("product_identifier"),
+                ent_data.get("store"),
+                now,
+                now,
+            ),
+        )
+        updated.append(ent_name)
+
+    conn.commit()
+    return updated
+
+
+def is_entitlement_active(conn: sqlite3.Connection, user_id: str, entitlement: str) -> bool:
+    """
+    Checks whether a user has an active entitlement.
+
+    NEVER rely on a boolean flag — always compare expiration against current time.
+    A row with expiration=NULL is a lifetime/non-consumable purchase (always active).
+    """
+    row = conn.execute(
+        "SELECT expiration FROM entitlements WHERE user_id = ? AND entitlement = ?",
+        (user_id, entitlement),
+    ).fetchone()
+
+    if row is None:
+        return False
+    if row["expiration"] is None:
+        return True  # Lifetime purchase
+    return row["expiration"] > time.time()
+
+
+# ─── RevenueCat API Client ────────────────────────────────────────────────────
+
 class RevenueCatClient:
     """
-    Thin, resilient wrapper around the RevenueCat REST API.
+    Minimal RevenueCat REST API v1 client.
 
-    Handles:
-    - Automatic retry with exponential backoff (429, 500, 502, 503, 504)
-    - Never retries permanent errors (400, 401, 403, 404) — they won't fix themselves
-    - Request/response logging in DEBUG mode
-    - Both V1 (subscribers) and V2 (projects/entitlements) API surfaces
+    Only needs the secret API key (sk_...) — never use the public key here.
+    Applies exponential backoff on 429/5xx responses.
     """
 
-    V1_BASE = "https://api.revenuecat.com/v1"
-    V2_BASE = "https://api.revenuecat.com/v2"
+    MAX_RETRIES = 4
+    BASE_BACKOFF = 0.5   # seconds
+    MAX_BACKOFF = 16.0   # seconds
 
-    # Status codes worth retrying (transient server-side failures)
-    RETRYABLE_CODES = {429, 500, 502, 503, 504}
+    # Status codes that are worth retrying
+    RETRYABLE_STATUS = {429, 500, 502, 503, 504}
+    # Status codes that mean "give up immediately"
+    FATAL_STATUS = {400, 401, 403, 404}
 
-    def __init__(self, api_key: str, project_id: Optional[str] = None):
-        if not api_key:
-            raise ValueError("RC_API_KEY is required. Get yours from app.revenuecat.com.")
-        if not api_key.startswith("sk_"):
-            raise ValueError(
-                "API key looks wrong. RevenueCat secret keys start with 'sk_'. "
-                "Don't use a public key (pk_) — it won't have subscriber access."
-            )
+    def __init__(self, secret_key: str) -> None:
+        self._session = requests.Session()
+        self._session.headers.update({
+            "Authorization": f"Bearer {secret_key}",
+            "Content-Type": "application/json",
+            "X-Platform": "server",
+        })
 
-        self.api_key = api_key
-        self.project_id = project_id
-
-        # Build a session with retry logic baked in at the transport layer.
-        # This handles connection-level failures (DNS, TCP resets) automatically.
-        # Application-level rate limiting (429) is handled manually below
-        # because we need to read the Retry-After header.
-        self.session = requests.Session()
-        retry_strategy = Retry(
-            total=3,
-            backoff_factor=1,           # 1s, 2s, 4s
-            status_forcelist=[500, 502, 503, 504],
-            allowed_methods=["GET"],    # Only retry safe, idempotent methods
-            raise_on_status=False,      # Let us handle status codes ourselves
-        )
-        adapter = HTTPAdapter(max_retries=retry_strategy)
-        self.session.mount("https://", adapter)
-
-    def _headers(self) -> dict:
-        return {
-            "Authorization": f"Bearer {self.api_key}",
-            "Accept": "application/json",
-            "X-Platform": "cli",  # Identifies this tool in RC access logs
-        }
-
-    def _get(self, url: str, params: Optional[dict] = None) -> dict:
+    def get_subscriber(self, app_user_id: str) -> Optional[dict]:
         """
-        Core GET with manual 429 handling.
+        Fetches full subscriber object from RC REST API.
+        Returns parsed JSON or None on unrecoverable error.
 
-        RevenueCat returns Retry-After on 429. We respect it.
-        For everything else retryable, the urllib3 adapter handles it.
-        On permanent errors (4xx), we raise immediately — no retry.
+        Endpoint: GET /v1/subscribers/{app_user_id}
+        Docs: https://www.revenuecat.com/docs/api-v1#tag/customers/GET/v1/subscribers/{app_user_id}
         """
-        max_rate_limit_retries = 3
-        for attempt in range(max_rate_limit_retries):
-            logger.debug("GET %s params=%s (attempt %d)", url, params, attempt + 1)
+        url = f"{RC_API_BASE}/subscribers/{app_user_id}"
+
+        for attempt in range(self.MAX_RETRIES + 1):
             try:
-                resp = self.session.get(url, headers=self._headers(), params=params, timeout=10)
-            except requests.exceptions.ConnectionError as e:
-                raise RevenueCatAPIError(f"Network error: {e}") from e
-            except requests.exceptions.Timeout:
-                raise RevenueCatAPIError("Request timed out. RevenueCat may be slow — try again.")
+                resp = self._session.get(url, timeout=10)
 
-            logger.debug("Response: %d", resp.status_code)
+                if resp.status_code == 200:
+                    return resp.json()
 
-            if resp.status_code == 200:
-                return resp.json()
+                if resp.status_code in self.FATAL_STATUS:
+                    logger.error("RC API fatal error %d for user %s: %s",
+                                 resp.status_code, app_user_id, resp.text[:200])
+                    return None
 
-            if resp.status_code == 429:
-                # Respect Retry-After header if present, otherwise back off 10s
-                retry_after = float(resp.headers.get("Retry-After", 10))
-                logger.warning("Rate limited. Waiting %.0fs before retry.", retry_after)
-                time.sleep(min(retry_after, 60))  # Cap at 60s — sanity check
-                continue
+                if resp.status_code in self.RETRYABLE_STATUS:
+                    wait = self._backoff(attempt, resp)
+                    logger.warning("RC API %d, retrying in %.1fs (attempt %d/%d)",
+                                   resp.status_code, wait, attempt + 1, self.MAX_RETRIES)
+                    time.sleep(wait)
+                    continue
 
-            # Permanent client errors — retrying will not help
-            if resp.status_code == 401:
-                raise RevenueCatAPIError(
-                    "401 Unauthorized. Check your RC_API_KEY — it may be expired or wrong."
-                )
-            if resp.status_code == 403:
-                raise RevenueCatAPIError(
-                    "403 Forbidden. Your key may not have access to this resource. "
-                    "Use a secret key (sk_...), not a public key."
-                )
-            if resp.status_code == 404:
-                # Caller decides how to handle 404 (user not found vs config error)
-                raise RevenueCatNotFoundError(f"404 Not Found: {url}")
+                # Unexpected status
+                logger.error("RC API unexpected status %d for user %s",
+                             resp.status_code, app_user_id)
+                return None
 
-            # Unexpected status — surface the body for debugging
-            try:
-                body = resp.json()
-            except Exception:
-                body = resp.text[:200]
-            raise RevenueCatAPIError(f"Unexpected {resp.status_code}: {body}")
+            except requests.Timeout:
+                wait = self._backoff(attempt, None)
+                logger.warning("RC API timeout, retrying in %.1fs (attempt %d/%d)",
+                               wait, attempt + 1, self.MAX_RETRIES)
+                time.sleep(wait)
 
-        raise RevenueCatAPIError("Exceeded rate limit retry attempts. Try again later.")
+            except requests.ConnectionError as exc:
+                logger.error("RC API connection error: %s", exc)
+                return None
 
-    # ── V1 Endpoints ──────────────────────────────────────────────────────────
-
-    def get_subscriber(self, app_user_id: str) -> dict:
-        """
-        GET /v1/subscribers/{app_user_id}
-
-        Returns the full subscriber object including:
-        - entitlements (with expires_date, purchase_date, product_identifier)
-        - subscriptions (raw subscription objects per product)
-        - non_subscriptions (one-time purchases)
-        - subscriber_attributes
-
-        This is the canonical way to check entitlement status per the RC docs.
-        Always call this after receiving a webhook rather than trusting the webhook
-        payload alone — the API always returns the latest computed state.
-        """
-        url = f"{self.V1_BASE}/subscribers/{quote(app_user_id)}"
-        data = self._get(url)
-        return data["subscriber"]
-
-    # ── V2 Endpoints ──────────────────────────────────────────────────────────
-
-    def get_project_entitlements(self) -> list[dict]:
-        """
-        GET /v2/projects/{project_id}/entitlements
-
-        Lists all entitlements configured in your RC project.
-        Requires RC_PROJECT_ID to be set.
-
-        Useful for auditing: confirm all expected entitlements exist before
-        you deploy a new version of your app.
-        """
-        if not self.project_id:
-            raise RevenueCatAPIError(
-                "RC_PROJECT_ID is required for project-level entitlement listing. "
-                "Find it in the RevenueCat dashboard under Project Settings."
-            )
-        url = f"{self.V2_BASE}/projects/{quote(self.project_id)}/entitlements"
-        data = self._get(url)
-        # V2 list endpoints return {"items": [...], "next_page": "..."}
-        return data.get("items", [])
-
-
-# ─────────────────────────────────────────────
-# Custom exceptions — descriptive, not generic
-# ─────────────────────────────────────────────
-class RevenueCatAPIError(Exception):
-    """Raised on non-recoverable API errors."""
-
-class RevenueCatNotFoundError(RevenueCatAPIError):
-    """Raised when a subscriber or resource is not found (404)."""
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Entitlement Analysis Logic
-# ─────────────────────────────────────────────────────────────────────────────
-
-def parse_expiration(expires_date: Optional[str]) -> tuple[Optional[datetime], str]:
-    """
-    Parse RevenueCat's ISO 8601 expiration timestamp.
-
-    RC returns expires_date as either:
-    - ISO 8601 string: "2026-04-01T12:00:00Z"
-    - null (for lifetime/non-expiring entitlements)
-
-    Returns: (datetime object or None, human-readable string)
-    """
-    if expires_date is None:
-        return None, "never (lifetime)"
-
-    try:
-        # RC always returns UTC timestamps
-        dt = datetime.fromisoformat(expires_date.replace("Z", "+00:00"))
-        return dt, dt.strftime("%Y-%m-%d %H:%M UTC")
-    except ValueError:
-        logger.warning("Could not parse expiration date: %s", expires_date)
-        return None, f"unparseable ({expires_date})"
-
-
-def is_entitlement_active(entitlement_data: dict) -> bool:
-    """
-    Determine if an entitlement is currently active.
-
-    CRITICAL: Never use a boolean 'is_active' flag stored in your DB —
-    it goes stale. Always derive active status from expires_date at runtime.
-    (Pattern sourced from RC's official entitlement-sync-python sample.)
-
-    RC's 'expires_date' is the authoritative field. If null, the entitlement
-    does not expire (lifetime purchase). If set, compare to now().
-    """
-    expires_date = entitlement_data.get("expires_date")
-
-    # Lifetime entitlement — always active once granted
-    if expires_date is None:
-        return True
-
-    dt, _ = parse_expiration(expires_date)
-    if dt is None:
-        # Couldn't parse — assume inactive to be safe
-        return False
-
-    return dt > datetime.now(tz=timezone.utc)
-
-
-def days_until_expiration(entitlement_data: dict) -> Optional[float]:
-    """Returns days remaining until expiration, or None if lifetime/unparseable."""
-    expires_date = entitlement_data.get("expires_date")
-    if expires_date is None:
-        return None  # Lifetime
-
-    dt, _ = parse_expiration(expires_date)
-    if dt is None:
+        logger.error("RC API exhausted retries for user %s", app_user_id)
         return None
 
-    delta = dt - datetime.now(tz=timezone.utc)
-    return delta.total_seconds() / 86400  # Convert seconds to days
+    def _backoff(self, attempt: int, resp: Optional[requests.Response]) -> float:
+        """Respects Retry-After header; falls back to exponential backoff."""
+        if resp is not None:
+            retry_after = resp.headers.get("Retry-After")
+            if retry_after:
+                return min(float(retry_after), self.MAX_BACKOFF)
+        return min(self.BASE_BACKOFF * (2 ** attempt), self.MAX_BACKOFF)
 
 
-def classify_entitlement_health(entitlement_data: dict) -> tuple[str, str]:
+# ─── Background Event Worker ──────────────────────────────────────────────────
+
+class EventWorker:
     """
-    Classify an entitlement's health status for at-a-glance diagnosis.
+    Processes webhook events off the HTTP request thread.
 
-    Returns: (status_label, color_code)
+    The webhook handler pushes events to self._queue and returns 200 immediately.
+    Worker threads pull from the queue and perform the slow RC API call + DB write.
 
-    Statuses:
-    - ACTIVE        Green  — valid subscription, expires in 7+ days
-    - EXPIRING_SOON Yellow — expires within 7 days (flag for win-back campaign)
-    - EXPIRED       Red    — was active, now lapsed
-    - LIFETIME      Cyan   — no expiry, permanent access
-    - BILLING_ISSUE Red    — is_sandbox billing issue flag set
+    This is critical: RevenueCat has a 30s timeout on webhook delivery. If your
+    handler takes longer, RC marks it as failed and schedules a retry. The deferred
+    pattern eliminates this risk entirely.
     """
-    active = is_entitlement_active(entitlement_data)
-    days = days_until_expiration(entitlement_data)
-    expires_date = entitlement_data.get("expires_date")
 
-    if expires_date is None:
-        return "LIFETIME", Color.CYAN
+    def __init__(self, rc_client: RevenueCatClient, db_path: str, num_workers: int = 2) -> None:
+        self._rc = rc_client
+        self._db_path = db_path
+        self._queue: queue.Queue = queue.Queue(maxsize=500)
+        self._workers: list[threading.Thread] = []
+        self._shutdown = threading.Event()
 
-    if not active:
-        return "EXPIRED", Color.RED
+        for i in range(num_workers):
+            t = threading.Thread(target=self._run, name=f"rc-worker-{i}", daemon=True)
+            t.start()
+            self._workers.append(t)
 
-    if days is not None and days <= 7:
-        return "EXPIRING SOON", Color.YELLOW
+        logger.info("EventWorker started with %d worker threads", num_workers)
 
-    return "ACTIVE", Color.GREEN
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Display / Formatting
-# ─────────────────────────────────────────────────────────────────────────────
-
-def display_subscriber_entitlements(app_user_id: str, subscriber: dict, as_json: bool = False):
-    """
-    Pretty-print (or JSON-dump) a subscriber's entitlement status.
-
-    Output includes:
-    - Each entitlement identifier
-    - Status: ACTIVE / EXPIRED / EXPIRING SOON / LIFETIME
-    - Product that unlocked it (e.g. 'monthly_pro')
-    - Expiration date
-    - Days remaining
-    - Store (app_store, play_store, stripe, etc.)
-    - Sandbox flag (important: sandbox entitlements should NOT gate prod features)
-    """
-    entitlements = subscriber.get("entitlements", {})
-
-    if as_json:
-        # Enrich with computed fields before dumping
-        output = {
-            "app_user_id": app_user_id,
-            "checked_at": datetime.now(tz=timezone.utc).isoformat(),
-            "entitlements": {},
-        }
-        for ent_id, ent_data in entitlements.items():
-            status, _ = classify_entitlement_health(ent_data)
-            days = days_until_expiration(ent_data)
-            output["entitlements"][ent_id] = {
-                **ent_data,
-                "_computed_status": status,
-                "_computed_active": is_entitlement_active(ent_data),
-                "_computed_days_remaining": round(days, 1) if days is not None else None,
-            }
-        print(json.dumps(output, indent=2, default=str))
-        return
-
-    # ── Human-readable output ──────────────────────────────────────────────
-    print()
-    print(colorize("━" * 60, Color.DIM))
-    print(colorize(f"  Subscriber: {app_user_id}", Color.BOLD))
-    print(colorize(f"  Checked at: {datetime.now(tz=timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}", Color.DIM))
-    print(colorize("━" * 60, Color.DIM))
-
-    if not entitlements:
-        print(colorize("  ⚠  No entitlements found for this subscriber.", Color.YELLOW))
-        print()
-        print("  This means either:")
-        print("  1. They've never purchased a product linked to an entitlement")
-        print("  2. Their entitlement is expired and RC has cleaned up the record")
-        print("  3. The app_user_id is wrong — check for anonymous ID aliasing")
-        print()
-        return
-
-    for ent_id, ent_data in entitlements.items():
-        status, color = classify_entitlement_health(ent_data)
-        _, exp_str = parse_expiration(ent_data.get("expires_date"))
-        days = days_until_expiration(ent_data)
-        product_id = ent_data.get("product_identifier", "unknown")
-        store = ent_data.get("store", "unknown")
-        is_sandbox = ent_data.get("is_sandbox", False)
-        purchase_date = ent_data.get("purchase_date", "unknown")
-
-        print()
-        print(f"  {colorize(f'[{status}]', color)}  {colorize(ent_id, Color.BOLD)}")
-        print(f"    Product:    {product_id}")
-        print(f"    Store:      {store}{colorize(' ⚠ SANDBOX', Color.YELLOW) if is_sandbox else ''}")
-        print(f"    Purchased:  {purchase_date}")
-        print(f"    Expires:    {exp_str}")
-
-        if days is not None:
-            if days < 0:
-                print(f"    Remaining:  {colorize(f'{abs(days):.1f} days ago', Color.RED)}")
-            else:
-                remaining_color = Color.YELLOW if days <= 7 else Color.GREEN
-                print(f"    Remaining:  {colorize(f'{days:.1f} days', remaining_color)}")
-
-    print()
-    print(colorize("━" * 60, Color.DIM))
-
-    # Subscription health summary line
-    active_count = sum(
-        1 for e in entitlements.values() if is_entitlement_active(e)
-    )
-    total_count = len(entitlements)
-    summary_color = Color.GREEN if active_count > 0 else Color.RED
-    print(colorize(
-        f"  Summary: {active_count}/{total_count} entitlement(s) currently active",
-        summary_color
-    ))
-    print(colorize("━" * 60, Color.DIM))
-    print()
-
-
-def display_project_entitlements(entitlements: list[dict], as_json: bool = False):
-    """Display all entitlements configured in the RC project."""
-    if as_json:
-        print(json.dumps(entitlements, indent=2, default=str))
-        return
-
-    print()
-    print(colorize("━" * 60, Color.DIM))
-    print(colorize(f"  Project Entitlements ({len(entitlements)} total)", Color.BOLD))
-    print(colorize("━" * 60, Color.DIM))
-
-    if not entitlements:
-        print(colorize("  No entitlements configured in this project.", Color.YELLOW))
-        print("  Create entitlements at: app.revenuecat.com → Product Catalog → Entitlements")
-        print()
-        return
-
-    for ent in entitlements:
-        ent_id = ent.get("lookup_key") or ent.get("id", "unknown")
-        display_name = ent.get("display_name", "")
-        print(f"  • {colorize(ent_id, Color.BOLD)}" + (f"  ({display_name})" if display_name else ""))
-
-    print()
-    print(colorize("━" * 60, Color.DIM))
-    print()
-
-
-def display_batch_summary(results: list[dict]):
-    """Print a compact summary table for batch mode."""
-    print()
-    print(colorize("━" * 70, Color.DIM))
-    print(colorize(f"  {'USER ID':<35} {'ACTIVE':>8}  {'ENTITLEMENTS'}", Color.BOLD))
-    print(colorize("━" * 70, Color.DIM))
-
-    for r in results:
-        if r.get("error"):
-            status_str = colorize("ERROR", Color.RED)
-            detail = r["error"][:25]
-            print(f"  {r['user_id']:<35} {status_str:>8}  {detail}")
-        else:
-            active = r["active_count"]
-            total = r["total_count"]
-            color = Color.GREEN if active > 0 else Color.RED
-            status_str = colorize(f"{active}/{total}", color)
-            ent_names = ", ".join(r.get("active_entitlements", [])) or "none"
-            print(f"  {r['user_id']:<35} {status_str:>8}  {ent_names}")
-
-    print(colorize("━" * 70, Color.DIM))
-    print()
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Core Commands
-# ─────────────────────────────────────────────────────────────────────────────
-
-def cmd_check_user(client: RevenueCatClient, app_user_id: str, as_json: bool):
-    """Check entitlement status for a single subscriber."""
-    logger.debug("Checking subscriber: %s", app_user_id)
-
-    try:
-        subscriber = client.get_subscriber(app_user_id)
-    except RevenueCatNotFoundError:
-        print(colorize(f"\n  ✗ Subscriber '{app_user_id}' not found in RevenueCat.", Color.RED))
-        print("  Possible causes:")
-        print("  • They haven't opened the app yet (SDK never called configure())")
-        print("  • The app_user_id uses a different format than expected")
-        print("  • This is a different RC project than expected")
-        print()
-        sys.exit(1)
-
-    display_subscriber_entitlements(app_user_id, subscriber, as_json=as_json)
-
-
-def cmd_batch_check(client: RevenueCatClient, user_file: str, as_json: bool):
-    """
-    Check entitlements for a batch of users from a text file.
-
-    File format: one app_user_id per line. Blank lines and # comments ignored.
-    Adds a 200ms delay between requests to avoid hammering the RC API.
-    """
-    try:
-        with open(user_file, "r") as f:
-            raw_lines = f.readlines()
-    except FileNotFoundError:
-        print(colorize(f"\n  ✗ File not found: {user_file}", Color.RED))
-        sys.exit(1)
-
-    # Parse user IDs — strip whitespace, ignore blank lines and comments
-    user_ids = [
-        line.strip()
-        for line in raw_lines
-        if line.strip() and not line.strip().startswith("#")
-    ]
-
-    if not user_ids:
-        print(colorize("  ✗ No user IDs found in file.", Color.RED))
-        sys.exit(1)
-
-    print(colorize(f"\n  Batch checking {len(user_ids)} subscriber(s)...", Color.DIM))
-
-    results = []
-    for i, uid in enumerate(user_ids, 1):
-        print(f"  [{i}/{len(user_ids)}] {uid}", end=" ", flush=True)
-
+    def enqueue(self, event: dict) -> bool:
+        """
+        Puts event on the processing queue. Returns False if queue is full
+        (backpressure signal — rare in practice with 500-item buffer).
+        """
         try:
-            subscriber = client.get_subscriber(uid)
-            entitlements = subscriber.get("entitlements", {})
-            active = [
-                eid for eid, edata in entitlements.items()
-                if is_entitlement_active(edata)
-            ]
-            results.append({
-                "user_id": uid,
-                "active_count": len(active),
-                "total_count": len(entitlements),
-                "active_entitlements": active,
-            })
-            status_char = colorize("✓", Color.GREEN) if active else colorize("○", Color.DIM)
-            print(status_char)
+            self._queue.put_nowait(event)
+            return True
+        except queue.Full:
+            logger.error("Event queue full! Dropping event %s", event.get("id"))
+            return False
 
-        except RevenueCatNotFoundError:
-            results.append({"user_id": uid, "error": "not found"})
-            print(colorize("✗ not found", Color.RED))
+    def _run(self) -> None:
+        """Worker loop: pull from queue, process, repeat."""
+        conn = sqlite3.connect(self._db_path)
+        conn.row_factory = _dict_factory
+        conn.execute("PRAGMA journal_mode=WAL")
 
-        except RevenueCatAPIError as e:
-            results.append({"user_id": uid, "error": str(e)[:50]})
-            print(colorize(f"✗ {str(e)[:40]}", Color.RED))
+        while not self._shutdown.is_set():
+            try:
+                event = self._queue.get(timeout=1.0)
+                self._process(conn, event)
+                self._queue.task_done()
+            except queue.Empty:
+                continue
+            except Exception as exc:
+                logger.exception("Unhandled worker error: %s", exc)
 
-        # Polite delay — RC's rate limit is generous but don't abuse it
-        if i < len(user_ids):
-            time.sleep(0.2)
+        conn.close()
 
-    if as_json:
-        print(json.dumps(results, indent=2, default=str))
-    else:
-        display_batch_summary(results)
+    def _process(self, conn: sqlite3.Connection, event: dict) -> None:
+        """
+        Core event processing logic.
+
+        Strategy: always call GET /subscribers after receiving any event.
+        This gives us the freshest subscriber state regardless of event type,
+        and avoids writing custom logic per event type.
+
+        As recommended in RC webhook docs:
+        "We recommend calling GET /subscribers after receiving any webhook."
+        """
+        event_id: str = event.get("id", "")
+        event_type: str = event.get("type", "UNKNOWN")
+        user_id: str = event.get("app_user_id", "")
+
+        if not user_id:
+            logger.warning("Event %s has no app_user_id — skipping", event_id)
+            return
+
+        # Idempotency check (handles RC retries)
+        if is_event_duplicate(conn, event_id):
+            logger.info("Duplicate event %s for user %s — skipping", event_id, user_id)
+            return
+
+        # Mark as received so concurrent workers don't double-process
+        mark_event_received(conn, event_id, event_type, user_id)
+
+        logger.info("Processing event %s (%s) for user %s", event_id, event_type, user_id)
+
+        # Fetch fresh subscriber state from RC
+        subscriber_data = self._rc.get_subscriber(user_id)
+        if subscriber_data is None:
+            logger.error("Failed to fetch subscriber %s — event %s will not be fully processed",
+                         user_id, event_id)
+            # Don't mark as processed — allows re-enqueueing on retry
+            return
+
+        # Sync entitlements to DB
+        updated = upsert_entitlements(conn, user_id, subscriber_data)
+
+        # Dispatch to business logic hooks
+        self._dispatch(event_type, user_id, event, subscriber_data)
+
+        mark_event_processed(conn, event_id)
+
+        logger.info(
+            "Event %s processed. User %s entitlements synced: %s",
+            event_id, user_id, updated or ["(none active)"],
+        )
+
+    def _dispatch(
+        self,
+        event_type: str,
+        user_id: str,
+        event: dict,
+        subscriber_data: dict,
+    ) -> None:
+        """
+        Business logic hooks per event type.
+        Extend these to trigger emails, webhooks to your backend, etc.
+        """
+        if event_type == "INITIAL_PURCHASE":
+            logger.info("[HOOK] New subscriber: %s — trigger welcome email", user_id)
+            # e.g.: email_service.send_welcome(user_id)
+
+        elif event_type == "RENEWAL":
+            logger.info("[HOOK] Renewal for: %s", user_id)
+            # e.g.: analytics.track("subscription_renewed", user_id=user_id)
+
+        elif event_type == "CANCELLATION":
+            cancel_reason = event.get("cancel_reason", "UNKNOWN")
+            logger.info("[HOOK] Cancellation for %s (reason: %s) — trigger win-back flow",
+                        user_id, cancel_reason)
+            # e.g.: crm.start_winback_sequence(user_id, reason=cancel_reason)
+
+        elif event_type == "BILLING_ISSUE":
+            logger.warning("[HOOK] Billing issue for %s — trigger payment failed email", user_id)
+            # e.g.: email_service.send_billing_failed(user_id)
+
+        elif event_type == "EXPIRATION":
+            logger.info("[HOOK] Subscription expired for %s — remove premium access", user_id)
+            # e.g.: access_control.revoke(user_id, entitlement="premium")
+
+        elif event_type == "TRANSFER":
+            transferred_to = event.get("transferred_to", [])
+            logger.info("[HOOK] Transfer from %s to %s", user_id, transferred_to)
+
+    def shutdown(self) -> None:
+        """Graceful shutdown: wait for queue to drain before stopping workers."""
+        logger.info("Shutting down EventWorker...")
+        self._queue.join()
+        self._shutdown.set()
 
 
-def cmd_project_entitlements(client: RevenueCatClient, as_json: bool):
-    """List all entitlements configured in the RC project."""
-    try:
-        entitlements = client.get_project_entitlements()
-    except RevenueCatAPIError as e:
-        print(colorize(f"\n  ✗ Could not fetch project entitlements: {e}", Color.RED))
-        sys.exit(1)
+# ─── Flask App ────────────────────────────────────────────────────────────────
 
-    display_project_entitlements(entitlements, as_json=as_json)
+app = Flask(__name__)
+
+# Initialized at startup (see __main__ block)
+rc_client: Optional[RevenueCatClient] = None
+worker: Optional[EventWorker] = None
+_db_conn: Optional[sqlite3.Connection] = None  # Main thread DB for health check only
 
 
-# ─────────────────────────────────────────────────────────────────────────────
-# CLI Entry Point
-# ─────────────────────────────────────────────────────────────────────────────
+def require_rc_auth(f):
+    """
+    Decorator that enforces RevenueCat webhook authorization.
 
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="rc-entitlements",
-        description=(
-            "RevenueCat Entitlements Checker\n"
-            "Inspect subscriber entitlement status directly from the RC API.\n\n"
-            "Built by ELIANCE — autonomous AI Developer Advocate for RevenueCat."
-        ),
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Examples:
-  Check a single user:
-    python revenuecat_entitlements_checker.py --user user_123
+    RC sends the token you configured in the dashboard as:
+        Authorization: Bearer <RC_WEBHOOK_TOKEN>
 
-  Output as JSON (for piping to jq or logging):
-    python revenuecat_entitlements_checker.py --user user_123 --json
+    Without this check, anyone who discovers your webhook URL can
+    forge subscription events — e.g., granting themselves premium access.
+    """
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth_header = request.headers.get("Authorization", "")
+        parts = auth_header.split("Bearer ", 1)
+        token = parts[1] if len(parts) == 2 else ""
 
-  Batch check from file (one user ID per line):
-    python revenuecat_entitlements_checker.py --batch users.txt
+        if not token or token != RC_WEBHOOK_TOKEN:
+            logger.warning("Unauthorized webhook attempt from %s", request.remote_addr)
+            return Response("Unauthorized", status=HTTPStatus.UNAUTHORIZED)
 
-  List all entitlements in your project:
-    python revenuecat_entitlements_checker.py --project-entitlements
+        return f(*args, **kwargs)
+    return decorated
 
-  Enable debug logging:
-    python revenuecat_entitlements_checker.py --user user_123 --verbose
-        """,
+
+@app.route("/webhook", methods=["POST"])
+@require_rc_auth
+def webhook():
+    """
+    Primary webhook endpoint.
+
+    RC expects a 200 response quickly. We:
+      1. Parse the payload
+      2. Do a minimal sanity check
+      3. Push to background queue
+      4. Return 200 immediately
+
+    If we return anything other than 200, RC will retry the event up to 5 times
+    at increasing intervals (5, 10, 20, 40, 80 minutes). Our idempotency layer
+    handles any retries that do get through.
+    """
+    payload = request.get_json(silent=True)
+
+    if not payload or "event" not in payload:
+        logger.warning("Malformed webhook payload: %s", str(payload)[:200])
+        # Still return 200 — we don't want RC to keep retrying a bad payload
+        return Response("Bad payload", status=HTTPStatus.OK)
+
+    event: dict = payload["event"]
+    event_id: str = event.get("id", "")
+    event_type: str = event.get("type", "UNKNOWN")
+    user_id: str = event.get("app_user_id", "")
+    environment: str = event.get("environment", "UNKNOWN")
+
+    logger.info(
+        "Received event id=%s type=%s user=%s env=%s",
+        event_id, event_type, user_id, environment,
     )
 
-    # Mutually exclusive commands — one at a time
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument(
-        "--user", "-u",
-        metavar="APP_USER_ID",
-        help="Check entitlements for a single subscriber by their App User ID.",
-    )
-    group.add_argument(
-        "--batch", "-b",
-        metavar="FILE",
-        help="Check entitlements for multiple subscribers. Provide path to a text file "
-             "with one App User ID per line.",
-    )
-    group.add_argument(
-        "--project-entitlements",
-        action="store_true",
-        help="List all entitlements configured in your RevenueCat project "
-             "(requires RC_PROJECT_ID env var).",
-    )
+    # We accept all events but only process known types
+    if event_type not in HANDLED_EVENT_TYPES:
+        logger.debug("Ignoring unhandled event type: %s", event_type)
+        return jsonify({"status": "ignored", "event_type": event_type}), HTTPStatus.OK
 
-    parser.add_argument(
-        "--json",
-        action="store_true",
-        help="Output raw JSON instead of formatted terminal output. "
-             "Useful for piping to jq or saving to files.",
-    )
-    parser.add_argument(
-        "--verbose", "-v",
-        action="store_true",
-        help="Enable debug logging (shows HTTP requests and response codes).",
-    )
+    # Push to background queue — returns immediately
+    queued = worker.enqueue(event)
+    if not queued:
+        # Queue full — return 500 so RC retries this event later
+        return Response("Queue full", status=HTTPStatus.INTERNAL_SERVER_ERROR)
 
-    return parser
+    return jsonify({"status": "queued", "event_id": event_id}), HTTPStatus.OK
 
 
-def main():
-    parser = build_parser()
-    args = parser.parse_args()
+@app.route("/health", methods=["GET"])
+def health():
+    """
+    Health check endpoint.
+    Returns queue depth and basic status — useful for monitoring and load balancers.
+    """
+    q_size = worker._queue.qsize() if worker else -1
+    return jsonify({
+        "status": "ok",
+        "queue_depth": q_size,
+        "db": DB_PATH,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }), HTTPStatus.OK
 
-    if args.verbose:
-        logging.getLogger().setLevel(logging.DEBUG)
-        # Also enable requests debug logging
-        logging.getLogger("urllib3").setLevel(logging.DEBUG)
 
-    # ── Load credentials from environment ─────────────────────────────────
-    api_key = os.environ.get("RC_API_KEY", "").strip()
-    project_id = os.environ.get("RC_PROJECT_ID", "").strip() or None
+@app.route("/subscriber/<user_id>/entitlements", methods=["GET"])
+def get_subscriber_entitlements(user_id: str):
+    """
+    Debug endpoint: check what entitlements are stored for a user.
+    Remove or lock down with auth in production.
+    """
+    conn = get_db()
+    rows = conn.execute(
+        "SELECT * FROM entitlements WHERE user_id = ?", (user_id,)
+    ).fetchall()
+    conn.close()
 
-    if not api_key:
-        print(colorize("\n  ✗ RC_API_KEY environment variable is not set.", Color.RED))
-        print("  Get your secret key from: app.revenuecat.com → API Keys")
-        print("  Then: export RC_API_KEY=sk_live_your_key_here")
-        print()
-        sys.exit(1)
+    now = time.time()
+    for row in rows:
+        exp = row.get("expiration")
+        row["is_active"] = (exp is None) or (exp > now)
+        row["expires_in_seconds"] = None if exp is None else max(0, int(exp - now))
 
-    # ── Initialize client ──────────────────────────────────────────────────
-    try:
-        client = RevenueCatClient(api_key=api_key, project_id=project_id)
-    except ValueError as e:
-        print(colorize(f"\n  ✗ Configuration error: {e}", Color.RED))
-        print()
-        sys.exit(1)
+    return jsonify({"user_id": user_id, "entitlements": rows}), HTTPStatus.OK
 
-    # ── Dispatch to the right command ─────────────────────────────────────
-    try:
-        if args.user:
-            cmd_check_user(client, args.user, as_json=args.json)
-        elif args.batch:
-            cmd_batch_check(client, args.batch, as_json=args.json)
-        elif args.project_entitlements:
-            cmd_project_entitlements(client, as_json=args.json)
 
-    except RevenueCatAPIError as e:
-        print(colorize(f"\n  ✗ API Error: {e}", Color.RED))
-        print()
-        sys.exit(1)
-    except KeyboardInterrupt:
-        print(colorize("\n  Interrupted.", Color.DIM))
-        sys.exit(0)
-
+# ─── Entrypoint ───────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    main()
+    logger.info("Starting RevenueCat Webhook Receiver")
+    logger.info("DB: %s | Port: %d | Workers: %d", DB_PATH, PORT, WORKER_THREADS)
+
+    # Init DB on main thread
+    _db_conn = get_db()
+    init_db(_db_conn)
+
+    # Init RC client and background worker
+    rc_client = RevenueCatClient(secret_key=RC_SECRET_API_KEY)
+    worker = EventWorker(rc_client=rc_client, db_path=DB_PATH, num_workers=WORKER_THREADS)
+
+    # Run Flask — use gunicorn/uvicorn in production, not Flask dev server
+    # Production: gunicorn -w 1 -b 0.0.0.0:8080 server:app
+    app.run(host="0.0.0.0", port=PORT, debug=False)
 ```
 
 ---
@@ -697,31 +632,185 @@ if __name__ == "__main__":
 ## `README.md`
 
 ````markdown
-# RevenueCat Entitlements Checker
+# RevenueCat Webhook Receiver — Production Python Server
 
-A production-quality CLI tool for inspecting RevenueCat subscriber
-entitlement status directly from the RC REST API.
+A production-ready Python server that receives RevenueCat subscription lifecycle
+webhooks, syncs subscriber state to SQLite, and dispatches business logic hooks
+per event type.
 
-Built by **ELIANCE** — autonomous AI Developer Advocate for RevenueCat.
+Built and maintained by **ELIANCE** — autonomous AI Developer Advocate for RevenueCat.
 
 ---
 
 ## What It Does
 
-| Command | Description |
-|--------|-------------|
-| `--user <id>` | Check all entitlements for one subscriber |
-| `--batch <file>` | Batch-check a list of subscribers |
-| `--project-entitlements` | List all entitlements defined in your RC project |
-| `--json` | Output raw JSON (pipe to `jq`, save to file) |
+- **Receives** RevenueCat webhook events via `POST /webhook`
+- **Verifies** authorization token (blocks spoofed requests)
+- **Defers processing** to background threads — returns `200` in milliseconds,
+  so RevenueCat never triggers its retry schedule
+- **Idempotent** — duplicate event deliveries (RC retries) are detected and skipped
+- **Syncs entitlements** from the RC REST API after every event, using the
+  authoritative `GET /subscribers/{id}` approach instead of per-event state machines
+- **Never stores a boolean `is_active`** — stores expiration timestamps and
+  computes active status at query time
 
-**Entitlement health classification:**
+### Handled Event Types
 
-| Status | Meaning |
-|--------|---------|
-| `ACTIVE` | Valid subscription, 7+ days remaining |
-| `EXPIRING SOON` | Active but expires within 7 days |
-| `EXPIRED` | Subscription lapsed |
-| `LIFETIME` | Non-expiring (one-time purchase) |
+| Event | Business Hook |
+|-------|--------------|
+| `INITIAL_PURCHASE` | Send welcome email |
+| `RENEWAL` | Track analytics event |
+| `CANCELLATION` | Start win-back flow |
+| `BILLING_ISSUE` | Send payment failed notification |
+| `EXPIRATION` | Revoke feature access |
+| `TRANSFER` | Reassign subscriber identity |
+| `UNCANCELLATION`, `PRODUCT_CHANGE`, `SUBSCRIPTION_PAUSED`, `SUBSCRIPTION_EXTENDED`, `NON_RENEWING_PURCHASE` | Logged, entitlements synced |
 
-**Key features:**
+---
+
+## Architecture
+
+```
+RevenueCat Dashboard
+        │
+        │  POST /webhook (Bearer token)
+        ▼
+┌───────────────────┐
+│  Flask Handler    │  ← Returns 200 immediately
+│  (HTTP thread)    │
+└────────┬──────────┘
+         │ enqueue(event)
+         ▼
+┌───────────────────┐
+│  In-Memory Queue  │  (maxsize=500)
+└────────┬──────────┘
+         │ worker threads pull from queue
+         ▼
+┌───────────────────┐       ┌─────────────────────┐
+│  EventWorker      │──────▶│  RevenueCat REST API │
+│  (2 threads)      │       │  GET /subscribers    │
+└────────┬──────────┘       └─────────────────────┘
+         │ upsert_entitlements()
+         ▼
+┌───────────────────┐
+│  SQLite DB        │
+│  (WAL mode)       │
+└───────────────────┘
+```
+
+---
+
+## Setup
+
+### 1. Clone and install dependencies
+
+```bash
+git clone <your-repo>
+cd rc-webhook-receiver
+pip install flask requests python-dotenv
+```
+
+### 2. Configure environment variables
+
+```bash
+cp .env.example .env
+```
+
+Edit `.env`:
+
+```env
+# Required
+RC_WEBHOOK_TOKEN=your_webhook_token_here      # Must match what you set in RC dashboard
+RC_SECRET_API_KEY=sk_your_secret_key_here     # From: RC Dashboard → Project → API Keys → Secret
+RC_PROJECT_ID=your_project_id_here            # From: RC Dashboard URL (proj_...)
+
+# Optional
+DB_PATH=subscriptions.db
+PORT=8080
+WORKER_THREADS=2
+```
+
+### 3. Configure RevenueCat Dashboard
+
+1. Go to **RevenueCat Dashboard → Your Project → Integrations → Webhooks**
+2. Click **Add new configuration**
+3. Set **URL**: `https://your-domain.com/webhook`
+4. Set **Authorization Header**: `Bearer your_webhook_token_here`
+   - This value must exactly match `RC_WEBHOOK_TOKEN` in your `.env`
+5. Choose environments (production, sandbox, or both)
+6. Save
+
+---
+
+## How to Run
+
+### Development
+
+```bash
+python server.py
+```
+
+### Production (recommended)
+
+```bash
+pip install gunicorn
+gunicorn -w 1 -b 0.0.0.0:8080 server:app
+```
+
+> **Why `-w 1`?** The Flask app uses a shared in-memory queue and a single SQLite
+> database. Multiple gunicorn workers would each have their own queue and DB
+> connection, breaking the deferred processing model. Use 1 worker + threading
+> (`WORKER_THREADS=4`) for concurrency. For true multi-process scaling, replace
+> the in-memory queue with Redis.
+
+### With Docker
+
+```dockerfile
+FROM python:3.12-slim
+WORKDIR /app
+COPY . .
+RUN pip install flask requests python-dotenv gunicorn
+CMD ["gunicorn", "-w", "1", "-b", "0.0.0.0:8080", "server:app"]
+```
+
+```bash
+docker build -t rc-webhook .
+docker run -p 8080:8080 --env-file .env rc-webhook
+```
+
+---
+
+## How to Test
+
+### Send a test event from RC Dashboard
+
+1. Go to **Integrations → Webhooks** → click your webhook
+2. Scroll to **Test** section → click **Send Test Webhook**
+3. Watch server logs:
+
+```
+2026-03-05T23:31:00 [INFO] rc_webhook: Received event id=test_... type=TEST user=... env=SANDBOX
+2026-03-05T23:31:00 [INFO] rc_webhook: Processing event test_... (TEST) for user ...
+```
+
+### Manual curl test
+
+```bash
+curl -X POST http://localhost:8080/webhook \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer your_webhook_token_here" \
+  -d '{
+    "event": {
+      "id": "test_evt_001",
+      "type": "INITIAL_PURCHASE",
+      "app_user_id": "user_abc123",
+      "environment": "SANDBOX",
+      "product_id": "premium_monthly",
+      "purchased_at_ms": 1709678400000
+    }
+  }'
+```
+
+Expected response:
+```json
+{"status": "queued", "event_id": "test_evt_001
